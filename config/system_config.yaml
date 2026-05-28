@@ -3,11 +3,12 @@
 
 # Networking configuration for Laptop -> RPi communication
 network:
-  rpi_ip: "192.168.1.100"      # IP address of the Raspberry Pi 5 (change to "127.0.0.1" for local PC loopback testing)
+  rpi_ip: "127.0.0.1"      # IP address of the Raspberry Pi 5 (change to "127.0.0.1" for local PC loopback testing)
   port: 5005                  # UDP port for real-time coordinate streaming
 
-# Camera configuration (MindVision MC023CG-SY-UB)
+# Camera configuration (MindVision MC023CG-SY-UB or standard OpenCV)
 camera:
+  type: "mock"                 # Options: "mock" (simulator), "opencv" (standard webcams), "mindvision" (industrial SDK)
   resolution:
     width: 1280
     height: 720
