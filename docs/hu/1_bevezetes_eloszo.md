@@ -63,3 +63,24 @@ A leghíresebb és kereskedelmi forgalomban is megjelenő rendszer a német Frau
 A RoboKeeper mellett számos nemzetközi egyetemi kutatócsoport foglalkozott a témával (pl. a Müncheni Műszaki Egyetem vagy a Stanford University projektjei), amelyek különböző mechanikai és szoftveres megközelítéseket vizsgáltak. Míg egyes kutatásokban **lineáris vezetősínes rendszereket** alkalmaznak (ahol a kapus vízszintesen csúszik a kapuvonal mentén), a mi rendszerünk a klasszikus **forgó/dőlő elrendezést** követi. Ebben a konstrukcióban a kapus a kapu aljának közepén van rögzítve, és balra vagy jobbra dőlve fedi le a kapu területét. Ennek előnye a kisebb mechanikai tehetetlenség, ugyanakkor rendkívül gyors szöggyorsulást és precíz szögpozicionálást igényel a motortól, hogy a labda érkezése előtt a megfelelő dőlésszöget felvegye.
 
 A szakirodalomból kirajzolódik, hogy a korábbi rendszerek fő korlátját a számítási kapacitás és a kamerák ára jelentette. A nagy sebességű ipari kamerák és a valós idejű képfeldolgozáshoz szükséges számítógépek rendkívül drágák voltak. A mai modern Edge AI chipek (mint a Hailo-8L) és a megfizethetőbb ipari USB3 kamerák megjelenésével azonban lehetőség nyílik arra, hogy kompakt, beágyazott és költséghatékony architektúrával valósítsunk meg hasonló hatékonyságú rendszereket. Ez a technológiai váltás adja a jelen szakdolgozat fejlesztésének alapját és tudományos relevanciáját.
+
+## 1.5. Munkamegosztás
+
+Bár a robotkapus rendszer tervezése, összeszerelése és tesztelése szoros együttműködésben, közös csapatmunkaként valósult meg, a szakdolgozati követelményeknek megfelelően a feladatkörök és az egyéni felelősségek egyértelműen elkülönítésre kerültek. A rendszer komplexitása lehetővé tette, hogy a fejlesztési folyamatot két fő pillérre osszuk: a számítógépes látásra és 3D rekonstrukcióra (szoftveres bemenet), valamint a fizikai vezérlésre és mechatronikára (fizikai kimenet).
+
+### Morvai Roland feladatköre:
+A fejlesztés során az elsődleges felelősségem a kamerarendszer kezelése, az objektumdetektálási pipeline megvalósítása és a 3D-s koordináta-számítás kidolgozása volt. Feladataim közé tartoztak az alábbiak:
+* Az ipari MindVision kamerák hardveres és szoftveres integrációja, a képkockák nagysebességű beolvasásának (SDK/OpenCV) megvalósítása.
+* A labda 2D-s detektálási módszereinek leprogramozása: az interaktív HSV színszűrő kalibrációs modul megírása, valamint a YOLOv8 mély tanulási modell beillesztése.
+* A képfeldolgozás hatékonyságának növelése a sztereó képkockák párhuzamosításával (Parallel Batching).
+* A sztereó kamerarendszer kalibrációja (belső és külső kameraparaméterek meghatározása), rektifikálása és a 3D sztereó triangulációs osztály (`StereoTriangulator`) megírása.
+
+### Rácz Donát feladatköre:
+Donát elsődleges felelősségi köre a fizikai működés biztosítása, a pályagörbe-becslés és a motorok precíz vezérlése volt. Feladatai közé tartoztak az alábbiak:
+* A labda repülési/gurulási pályájának fizikai modellezése (gravitáció és légellenállás számítása), a kapusík metszéspont-előrejelző algoritmusának kifejlesztése.
+* A valós idejű kommunikációs protokollok tervezése (Ethernet UDP socketek a Laptop és a Pi 5 között, valamint soros kommunikáció a Pi és a motorvezérlő egység között).
+* A fizikai kapusmechanika mechanikai tervezése, a dőlő/forgó kapusfigurát mozgató motorok és vezérlőkártyák hardveres bekötése.
+* A motorok mozgásprofiljainak megvalósítása (S-görbe gyorsulási profilok a rángatásmentes mozgásért, PID pozíció-szabályozás).
+
+### Közös feladatok (Integráció):
+A vezérlődoboz szakszerű összeszerelése (ipari tápegység beépítése, zavarszűrés, hűtés kialakítása), a teljes zárt szabályozási kör együttes tesztelése, a hálózati késleltetések (Latency) mérése, valamint a fizikai tesztpad végső kalibrálása közös mérnöki munka eredménye.
