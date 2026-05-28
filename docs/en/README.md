@@ -1,105 +1,58 @@
-# Thesis Documentation Outline & Guidelines
+# Thesis Theoretical and Hardware Chapters Outline
 ## Real-Time 3D Ball Detection and Robot Goalkeeper Control
 
-This document contains the structure and chapter outlines of the Computer Engineering BSc thesis project at the University of Debrecen, Faculty of Informatics, in English. This outline is designed to serve as the foundation for the minimum 40-page Word document.
+This document contains the structure and detailed outlines of the thesis chapters that you can write **right now, before discussing the programming and implementation details**. This forms the backbone of the first 15-20 pages of your thesis.
 
 ---
 
-### Academic Formatting Guidelines (UD FI)
-* **Font:** Times New Roman 12pt (body text)
-* **Line Spacing:** 1.5 lines, justified alignment
-* **Margins:** Left: 3.5 cm (for binding), Right: 2.5 cm, Top/Bottom: 2.5 cm
-* **Heading Numbering:** Decimal system (e.g., 1., 1.1., 1.1.1.)
-* **References:** IEEE or Harvard style, cited in text (e.g., `[1]`)
-* **Figures & Tables:** Every figure and table must have a unique number and caption, and must be referenced in the body text.
+# Proposed Chapter Structure (Theory and Hardware Phase)
 
----
+## 1. Introduction and System Concept
+*This chapter introduces the project background, motivation, and objectives.*
+* **1.1 Foreword and Motivation:**
+  - The significance of real-time systems and mechatronics in modern industry.
+  - Why the robot goalkeeper topic is exciting (combining high-speed vision, sensor fusion, and fast actuator control).
+* **1.2 Topic Selection and Relevance:**
+  - The importance of high-speed image processing (autonomous driving, industrial quality inspection connection).
+* **1.3 Objectives:**
+  - Building a physical, real-time goalkeeper testbed capable of blocking a ball along the goal line.
+  - Making the system modular and low-latency.
+* **1.4 History of Robotics:**
+  - A brief historical overview from industrial robotic arms (e.g., Unimate) to modern collaborative robots (cobots) and autonomous systems.
+* **1.5 Concept and Literature Review of Robot Goalkeepers:**
+  - Existing solutions (e.g., the RoboKeeper concept, university research projects).
+  - Differences between passive and active defense mechanisms.
+* **1.6 Division of Labor:**
+  - *Morvai Roland:* Image processing, stereo calibration, 3D reconstruction, and AI-based detection.
+  - *Rácz Donát:* Trajectory estimation, microcontroller-based control, physical mechatronics, and motor driving.
 
-# Proposed Thesis Chapter Structure
+## 2. Theoretical Foundations (Computer Vision and Mathematics)
+*This chapter clarifies the mathematical and theoretical background of 3D reconstruction and image processing.*
+* **2.1 Principles of Computer Vision:**
+  - Digital imaging process (pixel grids, color spaces: RGB vs. HSV color space theory, and why HSV is preferred for color thresholding).
+* **2.2 Stereo Vision Theory:**
+  - How human depth perception works and how it can be replicated using two cameras.
+  - Epipolar geometry theory (essential and fundamental matrices).
+* **2.3 Triangulation and Depth Estimation:**
+  - Mathematical definition of stereo disparity.
+  - Calculating 3D coordinates from 2D pixel coordinates (similar triangles principle, baseline and focal length relations).
+* **2.4 Theory of Object Detection Methods:**
+  - *Traditional methods:* Thresholding, contour detection, circle fitting (Hough Transform).
+  - *Modern methods:* Convolutional Neural Networks (CNN) principles, YOLO (You Only Look Once) architecture evolution and operations (Bounding boxes, confidence score, class predictions).
 
-## 1. Introduction
-* **Objective:** Introduce the project topic, relevance, and the significance of robot goalkeeper projects in industry and education (e.g., mechatronics, computer vision, real-time systems).
-* **Project Goal:** Build a physical testbed capable of intercepting a rolled/thrown ball along a goal line.
-* **Division of Labor (Morvai Roland & Rácz Donát):**
-  * *Morvai Roland:* Image processing, camera handling (MindVision SDK), stereo calibration, 3D reconstruction, and AI-based detection using the Hailo-8L NPU.
-  * *Rácz Donát:* Trajectory estimation, microcontroller-based control, physical mechatronics design, motor driving, and serial communication.
-
-## 2. Literature Review and Theoretical Background
-* **Computer Vision:** From 2D imaging to 3D reconstruction. Working principles of stereo camera systems (Epipolar geometry, triangulation).
-* **Object Detection:** Traditional color thresholding (OpenCV HSV-based segmentation) vs modern deep learning methods (YOLO architectures).
-* **Real-Time Systems:** Latency sources (camera exposure, USB transfer time, software demosaicing, processing time, communication jitter).
-* **Control Theory:** Trajectory estimation (physical filters like Kalman filter or ballistics models) and control of actuators (PID control, stepper/servo motors).
-
-## 3. System Specification and Hardware Architecture
-* **Control Box and Power Supply:**
-  * Sizing the 5V DC industrial power supply (requiring at least 5A to drive the Raspberry Pi 5 and peripherals under heavy load).
-  * Safety and professional wiring standards (grounding, noise suppression, active cooling).
-* **Computing Unit:** Raspberry Pi 5 (8GB RAM) + AI Hat (Hailo-8L, 13 TOPS).
-* **Camera System:** 
-  * 2x MindVision MC023CG-SY-UB cameras (2.3 Megapixel, Global Shutter, USB3.0).
-  * Importance of Global Shutter: eliminating image distortion (jello effect) caused by rolling shutter during fast ball movement.
-  * Lens focal length selection to optimize the Field of View (FOV).
-  * Data transmission: 2x EP-USB3HybridcableU-20 active optical cables (lossless high-speed transmission up to 20 meters).
-  * Synchronization: 2x CBL-702-8P-SYNC-5M0 cables for hardware triggering of both cameras (critical in stereo vision to ensure frames are captured at the exact same millisecond).
-
-## 4. Software Architecture and Optimization
-* **Analysis of the Raspberry Pi 5 Performance Bottleneck:**
-  * Why did the test code slow down? (Slow generic V4L2 backend in OpenCV, software demosaicing/Bayer conversion on Pi's CPU, single-threaded I/O and processing).
-* **Optimization Solutions:**
-  * *MindVision SDK Integration:* Utilizing Direct Memory Access (DMA) and hardware-level adjustments (exposure, gain, pixel format).
-  * *Multithreading/Multiprocessing:* Dedicated threads/processes for receiving camera frames (Frame Reader Threads) and a separate thread for processing and visualization. Double buffering technique.
-  * *NPU Acceleration:* Exporting YOLOv8-nano model to Hailo HEF format. Utilizing the AI Hat (Hailo-8L) for ball detection, reducing CPU usage to a minimum.
-  * *Resolution and ROI (Region of Interest) optimization:* Reading and processing only the relevant playing field area to reduce pixel data size.
-
-## 5. 3D Ball Detection and Stereo Vision
-* **Camera Calibration:** Chessboard-pattern calibration, determination of intrinsic and extrinsic camera parameters.
-* **Rectification:** Removing lens distortion and aligning stereo frame pairs.
-* **2D Detection:** Segmenting the ball using the Hailo NPU or optimized color-based segmentation.
-* **Triangulation:** Calculating 3D world coordinates (X, Y, Z) from 2D pixel coordinates (x1, y1) and (x2, y2) based on the camera baseline distance.
-
-## 6. Trajectory Estimation and Robot Control
-* **Trajectory Modeling:** Accounting for gravity and air resistance. Equations of motion for the ball in 3D space.
-* **Goal Line Intersection Prediction:** Estimating where (X, Y) and when the ball will cross the goal line based on Z-axis movement.
-* **Communication:** Serial communication protocol (UART / USB CDC) between the Raspberry Pi 5 and the robot control board (e.g., STM32, Arduino, or ESP32).
-* **Actuation Unit:** Driving stepper/servo motors, designing acceleration and deceleration profiles (S-curve), positioning with minimized overshoot.
-
-## 7. Experimental Results and Evaluation
-* **FPS and Latency Analysis:** Measuring frame rate and latency across different resolutions and optimization levels.
-* **Detection Accuracy:** Tracking error rates under various ball speeds.
-* **Goalkeeper Efficiency:** Success rate of saving incoming shots.
-
-## 8. Summary and Future Work
-* Summary of achievements.
-* Future improvements (e.g., predicting curved trajectories, smarter defense strategies).
-
----
-
-# Current Development Focus
-Phase 1 (Ball Detection and Stereo Tracking) has been successfully finalized on the PC side:
-1. **Bilingual Outline & Git repository** initialization. [x]
-2. **Camera Abstraction Layer** with Mock and OpenCV/MindVision camera support. [x]
-3. **HSV Calibration Suite** with real-time saving. [x]
-4. **YOLOv8 Parallel Stereo Batching** optimization. [x]
-5. **Loopback verification** completed. [x]
-
----
-
-# Appendix: Detailed Technical Description of Phase 1 (For Thesis)
-
-## White Soccer Ball (Size 5) HSV Calibration
-Tracking a white soccer ball in the HSV color space requires a specific configuration. Since white lacks distinct Hue and Saturation but is highly bright (high Value), we configured the default color segmentation boundaries as follows:
-* **Hue:** `0 - 180` (Covers the full range, as white surfaces can reflect ambient light and feature gray/black soccer panels).
-* **Saturation:** `0 - 60` (Low saturation filter to isolate colored objects in the background).
-* **Value:** `180 - 255` (High brightness threshold to ensure only white or reflective surfaces are segmented).
-
-This default range is interactive and can be tuned using the `--calibrate` parameter and saved directly to [config/system_config.yaml](file:///d:/Szakdolgozat/robot-goalkeeper-projekt/config/system_config.yaml) by pressing `s`.
-
-## YOLOv8 Stereo Tracking Optimization (Parallel Batching)
-In typical object detection setups, left and right frames are processed sequentially:
-$$\text{Time}_{\text{total}} = \text{Inference}(\text{Frame}_{\text{left}}) + \text{Inference}(\text{Frame}_{\text{right}})$$
-
-We implemented a **Parallel Batching** optimization. Both frames are grouped into a single tensor batch and sent to the network in parallel:
-$$\text{Time}_{\text{total}} = \text{Inference}([\text{Frame}_{\text{left}}, \text{Frame}_{\text{right}}])$$
-
-This leverages PyTorch's native hardware optimization, reducing overall frame inference time by **40-45%** compared to sequential processing, which is key for real-time (60+ FPS) operations.
-
+## 3. Hardware Architecture and Component Overview
+*This chapter presents the physical components, detailing technical specifications and design choices.*
+* **3.1 Computing Unit and AI Hat:**
+  - **Raspberry Pi 5 (8GB RAM):** Processor architecture (Broadcom BCM2712), performance updates compared to Pi 4, GPIO interfaces.
+  - **Raspberry Pi AI Hat (Hailo-8L NPU):** What is an NPU? 13 TOPS computing capacity and its role in accelerating deep learning models.
+* **3.2 Industrial Cameras and Optical Accessories:**
+  - **MindVision MC023CG-SY-UB:** Image sensor properties (Sony IMX392), Global Shutter theory (why it is critical to prevent rolling shutter distortion/jello effect in fast ball tracking).
+  - **Lenses:** Focal length, aperture, Field of View (FOV) planning.
+  - **EP-USB3HybridcableU-20 Active Optical USB 3.0 Cable:** Why active cables are required over 20 meters (signal attenuation and noise shielding).
+  - **CBL-702-8P-SYNC-5M0 Sync Cable:** Hardware trigger theory in stereo vision.
+* **3.3 Control Box and Power Management:**
+  - Engineering calculations for sizing the 5V DC power supply (incorporating Pi 5 power demands, AI Hat load, and USB camera power draws - requiring at least 5A / 25W).
+  - Control box layout, active cooling, and safety (grounding) aspects.
+* **3.4 Goalkeeper Mechanics and Actuators:**
+  - Description of Donát's physical mechanical rails, timing belts, and linear guides.
+  - Stepper/servo motors and drive boards (e.g., TB6600 or TMC drivers).
