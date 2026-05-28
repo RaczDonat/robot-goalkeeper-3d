@@ -29,10 +29,10 @@ stereo:
 detection:
   method: "hsv"                # Options: "hsv" (color thresholding) or "yolo" (deep learning)
   confidence_threshold: 0.5    # Minimum confidence for YOLO detection
-  hsv_bounds:                  # Default bounds for soccer ball detection (e.g. orange or white ball)
-    lower_h: 5
-    lower_s: 100
-    lower_v: 100
-    upper_h: 25
-    upper_s: 255
+  hsv_bounds:                  # Default bounds for white soccer ball detection (high brightness, low saturation)
+    lower_h: 0
+    lower_s: 0
+    lower_v: 180
+    upper_h: 180
+    upper_s: 60
     upper_v: 255

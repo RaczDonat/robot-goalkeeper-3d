@@ -21,7 +21,7 @@ def load_config(config_path: str) -> Dict[str, Any]:
         "network": {"rpi_ip": "127.0.0.1", "port": 5005},
         "camera": {"type": "mock", "resolution": {"width": 1280, "height": 720}, "fps": 60},
         "stereo": {"baseline_mm": 300.0, "focal_length_px": 1200.0, "cx": 640.0, "cy": 360.0, "left_camera_index": 0, "right_camera_index": 1},
-        "detection": {"method": "hsv", "confidence_threshold": 0.5, "hsv_bounds": {"lower_h": 5, "lower_s": 100, "lower_v": 100, "upper_h": 25, "upper_s": 255, "upper_v": 255}}
+        "detection": {"method": "hsv", "confidence_threshold": 0.5, "hsv_bounds": {"lower_h": 0, "lower_s": 0, "lower_v": 180, "upper_h": 180, "upper_s": 60, "upper_v": 255}}
     }
     
     try:
@@ -64,11 +64,11 @@ def setup_calibration_window(hsv_bounds: Dict[str, int]) -> None:
     cv2.namedWindow("HSV Calibration", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("HSV Calibration", 400, 350)
     
-    cv2.createTrackbar("Lower H", "HSV Calibration", hsv_bounds.get("lower_h", 5), 179, nothing)
-    cv2.createTrackbar("Upper H", "HSV Calibration", hsv_bounds.get("upper_h", 25), 179, nothing)
-    cv2.createTrackbar("Lower S", "HSV Calibration", hsv_bounds.get("lower_s", 100), 255, nothing)
-    cv2.createTrackbar("Upper S", "HSV Calibration", hsv_bounds.get("upper_s", 255), 255, nothing)
-    cv2.createTrackbar("Lower V", "HSV Calibration", hsv_bounds.get("lower_v", 100), 255, nothing)
+    cv2.createTrackbar("Lower H", "HSV Calibration", hsv_bounds.get("lower_h", 0), 179, nothing)
+    cv2.createTrackbar("Upper H", "HSV Calibration", hsv_bounds.get("upper_h", 180), 179, nothing)
+    cv2.createTrackbar("Lower S", "HSV Calibration", hsv_bounds.get("lower_s", 0), 255, nothing)
+    cv2.createTrackbar("Upper S", "HSV Calibration", hsv_bounds.get("upper_s", 60), 255, nothing)
+    cv2.createTrackbar("Lower V", "HSV Calibration", hsv_bounds.get("lower_v", 180), 255, nothing)
     cv2.createTrackbar("Upper V", "HSV Calibration", hsv_bounds.get("upper_v", 255), 255, nothing)
 
 def main() -> None:
@@ -108,13 +108,8 @@ def main() -> None:
         cam_left = MockCamera(width=width, height=height, fps=fps, is_left=True)
         cam_right = MockCamera(width=width, height=height, fps=fps, is_left=False)
 
-    # Initialize Ball Detectors
-    detector_left = BallDetector(
-        method=det_cfg["method"], 
-        hsv_bounds=det_cfg.get("hsv_bounds"), 
-        confidence_threshold=det_cfg["confidence_threshold"]
-    )
-    detector_right = BallDetector(
+    # Initialize a single Ball Detector for stereo tracking (supports parallel batching)
+    detector = BallDetector(
         method=det_cfg["method"], 
         hsv_bounds=det_cfg.get("hsv_bounds"), 
         confidence_threshold=det_cfg["confidence_threshold"]
@@ -159,10 +154,8 @@ def main() -> None:
                 # Dynamic update of HSV bounds
                 new_lower = np.array([lh, ls, lv])
                 new_upper = np.array([uh, us, uv])
-                detector_left.lower_hsv = new_lower
-                detector_left.upper_hsv = new_upper
-                detector_right.lower_hsv = new_lower
-                detector_right.upper_hsv = new_upper
+                detector.lower_hsv = new_lower
+                detector.upper_hsv = new_upper
 
             # 2. Capture frames
             ret_l, frame_l = cam_left.read()
@@ -174,9 +167,8 @@ def main() -> None:
 
             timestamp = cam_left.get_timestamp()
 
-            # 3. Run 2D Ball Detection
-            success_l, ball_l = detector_left.detect(frame_l)
-            success_r, ball_r = detector_right.detect(frame_r)
+            # 3. Run Optimized 2D Stereo Ball Detection (Parallel batching for YOLO)
+            success_l, ball_l, success_r, ball_r = detector.detect_stereo(frame_l, frame_r)
 
             x_3d, y_3d, z_3d = 0.0, 0.0, 0.0
             tracking_success = False
@@ -209,8 +201,8 @@ def main() -> None:
                 # In calibration mode, stack raw frames on top and binary masks on the bottom
                 hsv_l = cv2.cvtColor(frame_l, cv2.COLOR_BGR2HSV)
                 hsv_r = cv2.cvtColor(frame_r, cv2.COLOR_BGR2HSV)
-                mask_l = cv2.inRange(hsv_l, detector_left.lower_hsv, detector_left.upper_hsv)
-                mask_r = cv2.inRange(hsv_r, detector_right.lower_hsv, detector_right.upper_hsv)
+                mask_l = cv2.inRange(hsv_l, detector.lower_hsv, detector.upper_hsv)
+                mask_r = cv2.inRange(hsv_r, detector.lower_hsv, detector.upper_hsv)
                 
                 # Convert masks to 3-channel BGR so we can stack them with BGR frames
                 mask_l_bgr = cv2.cvtColor(mask_l, cv2.COLOR_GRAY2BGR)

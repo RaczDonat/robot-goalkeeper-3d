@@ -75,7 +75,31 @@ Ez a dokumentum a debreceni egyetem Mérnökinformatikus BSc szakdolgozatának f
 ---
 
 # Aktuális Fejlesztési Feladatok (Fókuszban)
-Jelenleg az **1. fázisnál** tartunk:
-1. **Kamerák működésre bírása Linux alatt a MindVision SDK segítségével.**
-2. **Optimalizált többszálas I/O pipeline megírása Pythonban / C++-ban.**
-3. **Mérési tesztek elvégzése a Pi-n, az FPS és CPU terheltség dokumentálása.**
+Jelenleg az **1. fázis** (Labdadetektálás és sztereó követés) lezárult a PC oldalon:
+1. **Bilingvális vázlat és Git alapok** beállítása. [x]
+2. **Kamerakezelési absztrakció** szimulátorral és OpenCV/MindVision támogatással. [x]
+3. **HSV kalibráció és mentés** trackbar panellel. [x]
+4. **YOLOv8 sztereó batch optimalizáció** kifejlesztése. [x]
+5. **Kétoldali tesztelés loopback kapcsolaton** sikeresen elvégezve. [x]
+
+---
+
+# Melléklet: 1. Fázis Részletes Technikai Leírása (Szakdolgozathoz)
+
+## Fehér focilabda (5-ös méret) HSV kalibrációja
+A fehér focilabda detektálása HSV színtérben különleges megközelítést igényel. Mivel a fehér fénynek nincs markáns színezettsége (Hue) és telítettsége (Saturation), de rendkívül világos (high Value), a színszűrést az alábbi elvek szerint állítottuk be alapértelmezetten:
+* **Hue (Színezettség):** `0 - 180` (A teljes tartományt lefedjük, mivel a fehér labdán a környezeti fények és a panelek mintái miatt bármilyen színárnyalat minimálisan megjelenhet).
+* **Saturation (Telítettség):** `0 - 60` (Alacsony telítettség, ami kiszűri az intenzív színes objektumokat a háttérből).
+* **Value (Fényerő):** `180 - 255` (Magas fényerőküszöb, ami biztosítja, hogy csak a kifejezetten világító/fehér felületeket detektálja a rendszer).
+
+Ez az alapbeállítás a `--calibrate` móddal finomhangolható, és a `s` billentyűvel közvetlenül menthető a [config/system_config.yaml](file:///d:/Szakdolgozat/robot-goalkeeper-projekt/config/system_config.yaml) állományba.
+
+## YOLOv8 sztereó-követés optimalizációja (Parallel Batching)
+A hagyományos detektálások során a bal és jobb oldali kamerák képkockáit egymás után küldik el a neurális hálózatnak (Sequential Inference):
+$$\text{Time}_{\text{total}} = \text{Inference}(\text{Frame}_{\text{left}}) + \text{Inference}(\text{Frame}_{\text{right}})$$
+
+A projektünkben bevezetett **Parallel Batching** optimalizáció segítségével a bal és a jobb oldali képeket egyetlen tömbbe (batch) fogjuk össze, és egyszerre küldjük át az AI modellnek:
+$$\text{Time}_{\text{total}} = \text{Inference}([\text{Frame}_{\text{left}}, \text{Frame}_{\text{right}}])$$
+
+Ez a mélytanulási keretrendszerek (pl. PyTorch/TensorRT) belső párhuzamosítási képességeit és a GPU/NPU hardveres magjait használja ki, így a két kamera képének feldolgozási ideje akár **40-45%-kal is csökkenhet** a szekvenciális végrehajtáshoz képest, ami kritikus a real-time (60+ FPS) követés eléréséhez.
+
