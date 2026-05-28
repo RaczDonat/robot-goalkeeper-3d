@@ -1,0 +1,37 @@
+# System Configuration File
+# Real-Time 3D Ball Detection and Robot Goalkeeper Control
+
+# Networking configuration for Laptop -> RPi communication
+network:
+  rpi_ip: "192.168.1.100"      # IP address of the Raspberry Pi 5 (change to "127.0.0.1" for local PC loopback testing)
+  port: 5005                  # UDP port for real-time coordinate streaming
+
+# Camera configuration (MindVision MC023CG-SY-UB)
+camera:
+  resolution:
+    width: 1280
+    height: 720
+  fps: 60                      # Frame rate (up to 100+ depending on resolution and SDK settings)
+  exposure_time_us: 10000      # Low exposure time to prevent motion blur of the fast ball
+  gain: 12                     # Analog/digital gain to compensate for low exposure
+
+# Stereo vision parameters (for 3D triangulation)
+stereo:
+  baseline_mm: 300.0           # Distance between the optical centers of the left and right cameras (in mm)
+  focal_length_px: 1200.0      # Camera focal length in pixels (determined after calibration)
+  principal_point_x: 640.0     # Optical center X (width / 2)
+  principal_point_y: 360.0     # Optical center Y (height / 2)
+  left_camera_index: 0         # Device index or serial number for the left camera
+  right_camera_index: 1        # Device index or serial number for the right camera
+
+# Ball Detection configurations
+detection:
+  method: "hsv"                # Options: "hsv" (color thresholding) or "yolo" (deep learning)
+  confidence_threshold: 0.5    # Minimum confidence for YOLO detection
+  hsv_bounds:                  # Default bounds for soccer ball detection (e.g. orange or white ball)
+    lower_h: 5
+    lower_s: 100
+    lower_v: 100
+    upper_h: 25
+    upper_s: 255
+    upper_v: 255
