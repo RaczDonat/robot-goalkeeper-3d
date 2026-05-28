@@ -84,3 +84,50 @@ Donát elsődleges felelősségi köre a fizikai működés biztosítása, a pá
 
 ### Közös feladatok (Integráció):
 A vezérlődoboz szakszerű összeszerelése (ipari tápegység beépítése, zavarszűrés, hűtés kialakítása), a teljes zárt szabályozási kör együttes tesztelése, a hálózati késleltetések (Latency) mérése, valamint a fizikai tesztpad végső kalibrálása közös mérnöki munka eredménye.
+
+## 1.6. Rendszer-architektúra és szabályozási kör
+
+A rendszer fizikai és logikai felépítését az alábbi két blokkvázlat szemlélteti, amelyek tisztázzák a hardverkomponensek közötti kapcsolatot és a zárt szabályozási kör felépítését.
+
+### 1. Ábra: Rendszerblokkvázlat (Adatáramlás és Hardverkapcsolatok)
+```mermaid
+graph TD
+    subgraph Megfigyelés (Játéktér)
+        Ball[ soccer Focilabda]
+    end
+
+    subgraph Képfeldolgozó egység (Laptop/PC)
+        CamL[Bal Kamera: MC023CG-SY-UB] -->|USB 3.0 aktív optikai kábel| PC[Laptop / PC]
+        CamR[Jobb Kamera: MC023CG-SY-UB] -->|USB 3.0 aktív optikai kábel| PC
+        Sync[Sync kábel: CBL-702-8P] <-->|Hardveres szinkron trigger| CamL
+        Sync <--> CamR
+        
+        PC -->|1. 2D detektálás: HSV / YOLO| Det[2D Detektáló modul]
+        Det -->|2. Disparity számítás| Tri[3D Trianguláció]
+        Tri -->|3. Trajektória predikció| Pred[Célpozíció kiszámítása]
+    end
+
+    subgraph Vezérlődoboz és Aktuáció
+        PC -->|Ethernet UDP csomagok: X,Y,Z| RPi5[Raspberry Pi 5]
+        PSU[5V DC Ipari tápegység] -->|Tápellátás| RPi5
+        RPi5 -->|Soros parancs / GPIO| Driver[Motorvezérlő kártya]
+        PSU -->|Tápellátás| Driver
+        Driver -->|Léptető/szervó vezérlőjelek| Motor[Motor]
+        Motor -->|Forgatás / Döntés| Keeper[Fizikai kapusfigura]
+    end
+
+    Pred -->|Célpozíció küldése| RPi5
+    Keeper -->|Fizikai blokkolás| Ball
+```
+
+### 2. Ábra: A Robotkapus zárt szabályozási köre
+```mermaid
+graph LR
+    Input[Labda röppályája] -->|Zavarás| Sum(( ))
+    Sum -->|Fizikai pozíció| Sensors[Érzékelők: Sztereó kamerák]
+    Sensors -->|Képkockák| Controller[Vezérlő: Laptop & RPi 5]
+    Controller -->|Vezérlőjel: dőlésszög| Actuator[Beavatkozó: Motorvezérlő & Motor]
+    Actuator -->|Fizikai elmozdulás| System[Szabályozott szakasz: Kapusfigura]
+    System -->|Hárítás| Sum
+    System -->|Visszacsatolás a téren át| Input
+```
