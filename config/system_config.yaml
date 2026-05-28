@@ -1,38 +1,92 @@
-# System Configuration File
+# System Configuration
 # Real-Time 3D Ball Detection and Robot Goalkeeper Control
 
-# Networking configuration for Laptop -> RPi communication
+# ---------------------------------------------------------------------------
+# Network (PC → Raspberry Pi)
+# ---------------------------------------------------------------------------
 network:
-  rpi_ip: "127.0.0.1"      # IP address of the Raspberry Pi 5 (change to "127.0.0.1" for local PC loopback testing)
-  port: 5005                  # UDP port for real-time coordinate streaming
+  rpi_ip: "127.0.0.1"   # Set to the Pi's actual IP for real deployment
+  port: 5005
 
-# Camera configuration (MindVision MC023CG-SY-UB or standard OpenCV)
+# ---------------------------------------------------------------------------
+# Camera
+# Type options: "ximea" | "mock" | "opencv" | "mindvision"
+# ---------------------------------------------------------------------------
 camera:
-  type: "mock"                 # Options: "mock" (simulator), "opencv" (standard webcams), "mindvision" (industrial SDK)
+  type: "ximea"
   resolution:
-    width: 1280
+    width: 1280    # pixels  (sensor max: 1936 × 1216)
     height: 720
-  fps: 60                      # Frame rate (up to 100+ depending on resolution and SDK settings)
-  exposure_time_us: 10000      # Low exposure time to prevent motion blur of the fast ball
-  gain: 12                     # Analog/digital gain to compensate for low exposure
+  fps: 60          # Only used by mock camera; XIMEA rate is set by exposure/bandwidth
 
-# Stereo vision parameters (for 3D triangulation)
+  # ── Exposure & gain for bright outdoor sunlight ─────────────────────────
+  # Short exposure freezes fast ball motion; low gain keeps sensor noise minimal.
+  # Bright sun provides more than enough light even at 800 µs.
+  # Adjust upward (e.g. 5000–15000 µs) for indoor / artificial lighting.
+  exposure_time_us: 800   # 0.8 ms → ~130 FPS at 1280×720 over USB3
+  gain: 0.0               # dB  (range 0–24; use 0 in bright conditions)
+
+# ---------------------------------------------------------------------------
+# Stereo vision (3-D triangulation parameters)
+# All values must be re-measured after physical camera calibration.
+# ---------------------------------------------------------------------------
 stereo:
-  baseline_mm: 300.0           # Distance between the optical centers of the left and right cameras (in mm)
-  focal_length_px: 1200.0      # Camera focal length in pixels (determined after calibration)
-  principal_point_x: 640.0     # Optical center X (width / 2)
-  principal_point_y: 360.0     # Optical center Y (height / 2)
-  left_camera_index: 0         # Device index or serial number for the left camera
-  right_camera_index: 1        # Device index or serial number for the right camera
+  baseline_mm: 300.0          # Distance between left and right lens centers (mm)
+  focal_length_px: 1200.0     # Calibrated focal length in pixels
+  principal_point_x: 640.0    # Optical center X  (≈ width / 2 before calibration)
+  principal_point_y: 360.0    # Optical center Y  (≈ height / 2 before calibration)
+  left_camera_index: 0        # XIMEA device index for the left camera
+  right_camera_index: 1       # XIMEA device index for the right camera
 
-# Ball Detection configurations
+# ---------------------------------------------------------------------------
+# Ball detection
+# ---------------------------------------------------------------------------
 detection:
-  method: "hsv"                # Options: "hsv" (color thresholding) or "yolo" (deep learning)
-  confidence_threshold: 0.5    # Minimum confidence for YOLO detection
-  hsv_bounds:                  # Default bounds for white soccer ball detection (high brightness, low saturation)
+  # "hybrid" uses all three layers: YOLO → HSV+Hough → Kalman
+  # "yolo"   uses only the YOLO layer (+ Kalman smoothing)
+  # "hsv"    uses only HSV+Hough    (+ Kalman smoothing)
+  method: "hybrid"
+
+  # YOLO model path or name.
+  # Default: "yolov8n.pt" (COCO general model, sports ball class 32).
+  # Swap for a fine-tuned soccer-ball model for higher accuracy, e.g.:
+  #   yolo_model_path: "models/yolov8n-soccer.pt"
+  yolo_model_path: "yolov8n.pt"
+
+  # Minimum YOLO confidence score accepted (0.0–1.0).
+  # Lower → more detections but more false positives.
+  confidence_threshold: 0.4
+
+  # ── HSV mask (outdoor white/light-coloured ball in bright sunlight) ──────
+  # Use  python3 src/pc_tracker.py --calibrate  to tune these live.
+  hsv_bounds:
     lower_h: 0
     lower_s: 0
-    lower_v: 180
+    lower_v: 200     # high brightness threshold for outdoor sun
     upper_h: 180
-    upper_s: 60
+    upper_s: 50      # low saturation → white ball
     upper_v: 255
+
+  # ── Hough Circle Transform parameters ────────────────────────────────────
+  # These control the HSV fallback layer's circle detector.
+  hough:
+    min_dist: 30       # Minimum distance between detected circle centres (px)
+    param1: 100        # Canny edge detector upper threshold
+    param2: 30         # Accumulator threshold – lower = more (noisier) detections
+    min_radius: 8      # Minimum expected ball radius (px)
+    max_radius: 120    # Maximum expected ball radius (px)
+
+  # ── Kalman filter ─────────────────────────────────────────────────────────
+  # Applied to both left and right camera tracks independently.
+  kalman:
+    enabled: true
+    process_noise: 0.01       # Higher = trust motion model less, react faster
+    measurement_noise: 0.1    # Higher = trust raw detections less, smoother output
+    max_coast_frames: 10      # Frames to predict without measurement before reset
+
+  # ── Region-of-Interest (ROI) speedup ─────────────────────────────────────
+  # When enabled, the HSV+Hough layer searches only the area around the last
+  # known ball position, significantly reducing processing time.
+  roi:
+    enabled: true
+    padding_factor: 2.5    # ROI half-size = ball_radius × padding_factor
