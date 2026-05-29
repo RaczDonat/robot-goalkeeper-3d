@@ -2,6 +2,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    import torch as _torch
+    _CUDA_AVAILABLE = _torch.cuda.is_available()
+except ImportError:
+    _CUDA_AVAILABLE = False
+
 # pyrefly: ignore [missing-import]
 import cv2
 import numpy as np
@@ -135,6 +141,7 @@ class BallDetector:
         # Per-camera ROI state (updated each frame)
         self._roi_left:  Optional[Tuple[int, int, int, int]] = None   # x1,y1,x2,y2
         self._roi_right: Optional[Tuple[int, int, int, int]] = None
+        self._frame_counter: int = 0
 
         # ── Kalman trackers (one per camera) ──────────────────────────────────
         kc = kalman_cfg or {}
@@ -148,13 +155,18 @@ class BallDetector:
 
         # ── YOLO ──────────────────────────────────────────────────────────────
         self.yolo_model = None
+        # Use GPU with FP16 when available – roughly 2× faster than CPU FP32
+        self._device = "cuda" if _CUDA_AVAILABLE else "cpu"
+        self._half   = _CUDA_AVAILABLE  # FP16 only supported on CUDA
         if self.method in ("yolo", "hybrid"):
             self._init_yolo(yolo_model_path)
 
         logger.info(
-            "BallDetector ready | method=%s | yolo=%s",
+            "BallDetector ready | method=%s | yolo=%s | device=%s | half=%s",
             self.method,
             "loaded" if self.yolo_model else "unavailable",
+            self._device,
+            self._half,
         )
 
     # ------------------------------------------------------------------
@@ -212,11 +224,39 @@ class BallDetector:
         if frame_left is None or frame_right is None:
             return DetectionResult(), DetectionResult()
 
+        self._frame_counter += 1
+        
+        is_tracking = (self._roi_left is not None and self._roi_right is not None)
+        
+        if self.method == "hybrid":
+            # 1. If tracking, use fast HSV on ROIs.
+            # To prevent drift, force a YOLO validation check every 10 frames.
+            force_yolo = is_tracking and (self._frame_counter % 10 == 0)
+            
+            if is_tracking and not force_yolo:
+                hsv_left = self._detect_hsv_hough(frame_left, self._roi_left)
+                hsv_right = self._detect_hsv_hough(frame_right, self._roi_right)
+                if hsv_left.success and hsv_right.success:
+                    result_left, self._roi_left = self._finalise(
+                        frame_left, hsv_left, self._kalman_left, self._roi_left
+                    )
+                    result_right, self._roi_right = self._finalise(
+                        frame_right, hsv_right, self._kalman_right, self._roi_right
+                    )
+                    return result_left, result_right
+            
+            # 2. If searching (lost), run YOLO only every 5 frames to save CPU.
+            # On the other 4 frames, YOLO is skipped, and we fall back to downsampled full-frame HSV.
+            run_yolo = not is_tracking or (self._frame_counter % 5 == 0)
+        else:
+            # "yolo" mode runs YOLO on every frame
+            run_yolo = True
+
         yolo_left: Optional[DetectionResult] = None
         yolo_right: Optional[DetectionResult] = None
 
         # ── YOLO batch (primary layer) ────────────────────────────────────────
-        if self.method in ("yolo", "hybrid") and self.yolo_model is not None:
+        if run_yolo and self.method in ("yolo", "hybrid") and self.yolo_model is not None:
             yolo_left, yolo_right = self._yolo_batch(frame_left, frame_right)
 
         # ── Per-camera fallback + Kalman ──────────────────────────────────────
@@ -286,7 +326,13 @@ class BallDetector:
         yolo_result: Optional[DetectionResult] = None
 
         if self.method in ("yolo", "hybrid") and self.yolo_model is not None:
-            results = self.yolo_model.predict(frame, verbose=False, conf=self.confidence_threshold)
+            results = self.yolo_model.predict(
+                frame, 
+                verbose=False, 
+                conf=self.confidence_threshold,
+                imgsz=320,
+                half=False
+            )
             yolo_result = self._parse_yolo_result(results[0])
 
         return self._finalise(frame, yolo_result, kalman, roi)
@@ -306,6 +352,9 @@ class BallDetector:
                 [frame_left, frame_right],
                 verbose=False,
                 conf=self.confidence_threshold,
+                imgsz=320,
+                device=self._device,
+                half=self._half,
             )
             return (
                 self._parse_yolo_result(results[0]),
@@ -386,6 +435,7 @@ class BallDetector:
         """
         h_frame, w_frame = frame.shape[:2]
         x_offset = y_offset = 0
+        ds_factor = 1.0
 
         # Apply ROI crop if available and enabled
         work = frame
@@ -397,30 +447,44 @@ class BallDetector:
                 work     = frame[y1:y2, x1:x2]
                 x_offset = x1
                 y_offset = y1
+        else:
+            # If scanning full frame, downsample for speed if resolution is large
+            if w_frame > 640:
+                ds_factor = 2.0
+                new_w = int(w_frame / ds_factor)
+                new_h = int(h_frame / ds_factor)
+                work = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
         # ── HSV threshold ──────────────────────────────────────────────────
         hsv  = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.lower_hsv, self.upper_hsv)
 
-        # Morphological clean-up
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Morphological clean-up (scaled dynamically to resolution)
+        close_sz = max(3, int(7 / ds_factor))
+        if close_sz % 2 == 0: close_sz += 1
+        open_sz = max(3, int(5 / ds_factor))
+        if open_sz % 2 == 0: open_sz += 1
+        blur_sz = max(3, int(9 / ds_factor))
+        if blur_sz % 2 == 0: blur_sz += 1
+
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_sz, close_sz))
+        kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_sz, open_sz))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)  # fill holes
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open)   # remove small noise
 
         # Blur for Hough stability
-        blurred = cv2.GaussianBlur(mask, (9, 9), 2)
+        blurred = cv2.GaussianBlur(mask, (blur_sz, blur_sz), 2.0 / ds_factor)
 
         # ── Hough Circle Transform ─────────────────────────────────────────
         circles = cv2.HoughCircles(
             blurred,
             cv2.HOUGH_GRADIENT,
             dp=1.2,
-            minDist=self._hough_min_dist,
+            minDist=max(1.0, self._hough_min_dist / ds_factor),
             param1=self._hough_param1,
             param2=self._hough_param2,
-            minRadius=self._hough_min_radius,
-            maxRadius=self._hough_max_radius,
+            minRadius=max(1, int(self._hough_min_radius / ds_factor)),
+            maxRadius=max(2, int(self._hough_max_radius / ds_factor)),
         )
 
         if circles is None:
@@ -431,26 +495,20 @@ class BallDetector:
         # circles shape: (N, 3) → [cx, cy, r]
         best = circles[0]   # HoughCircles returns them sorted by vote count
 
-        cx = int(best[0]) + x_offset
-        cy = int(best[1]) + y_offset
-        r  = int(best[2])
+        # Convert coordinates to full scale
+        cx = int(best[0] * ds_factor) + x_offset
+        cy = int(best[1] * ds_factor) + y_offset
+        r  = int(best[2] * ds_factor)
 
         # Basic circularity validation using the mask
         if r < 2:
             return DetectionResult()
 
-        # Compute pixel coverage inside the detected circle on the original mask
-        if self._roi_enabled and roi is not None:
-            full_mask = cv2.inRange(
-                cv2.cvtColor(frame, cv2.COLOR_BGR2HSV),
-                self.lower_hsv, self.upper_hsv,
-            )
-        else:
-            full_mask = mask   # already full-frame when no ROI
-
-        coverage = self._circle_mask_coverage(full_mask, cx, cy, r)
-        if coverage < 0.25:
-            # Less than 25% of the circle area is white → probably noise
+        # Compute pixel coverage inside the detected circle on the local mask
+        # Doing this on the local (ROI or downsampled) mask is much faster than recalculating on full frame
+        coverage = self._circle_mask_coverage(mask, int(best[0]), int(best[1]), int(best[2]))
+        if coverage < 0.40:
+            # Less than 40% of the circle area is white → probably noise or a line
             return DetectionResult()
 
         # Confidence: scale coverage → 0.5–0.9 range (HSV is less certain than YOLO)
@@ -470,13 +528,30 @@ class BallDetector:
     def _circle_mask_coverage(mask: np.ndarray, cx: int, cy: int, r: int) -> float:
         """Fraction of pixels inside the circle that are white (255) in the mask."""
         h, w = mask.shape[:2]
-        # Create a single-channel circle mask
-        circle_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.circle(circle_mask, (cx, cy), max(r, 1), 255, -1)
-        circle_area = np.count_nonzero(circle_mask)
+        
+        # Crop the mask around the circle for performance (avoid full array allocations)
+        x1 = max(0, cx - r)
+        y1 = max(0, cy - r)
+        x2 = min(w, cx + r + 1)
+        y2 = min(h, cy + r + 1)
+        
+        if (x2 - x1) <= 0 or (y2 - y1) <= 0:
+            return 0.0
+            
+        crop_mask = mask[y1:y2, x1:x2]
+        
+        # Draw the circle on the local cropped mask coordinate space
+        local_cx = cx - x1
+        local_cy = cy - y1
+        
+        local_circle_mask = np.zeros(crop_mask.shape, dtype=np.uint8)
+        cv2.circle(local_circle_mask, (local_cx, local_cy), max(r, 1), 255, -1)
+        
+        circle_area = np.count_nonzero(local_circle_mask)
         if circle_area == 0:
             return 0.0
-        overlap = np.count_nonzero(cv2.bitwise_and(mask, circle_mask))
+            
+        overlap = np.count_nonzero(cv2.bitwise_and(crop_mask, local_circle_mask))
         return overlap / circle_area
 
     # ------------------------------------------------------------------

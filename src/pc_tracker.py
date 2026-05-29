@@ -139,8 +139,11 @@ def _build_cameras(cam_cfg: Dict[str, Any], stereo_cfg: Dict[str, Any]):
         logger.info("Initializing XIMEA cameras (indices %d, %d).", left_idx, right_idx)
         exposure: int = cam_cfg.get("exposure_time_us", 800)
         gain: float = cam_cfg.get("gain", 0.0)
-        cam_left = XimeaCamera(left_idx, width, height, exposure, gain)
-        cam_right = XimeaCamera(right_idx, width, height, exposure, gain)
+        offset_x = cam_cfg["resolution"].get("offset_x")
+        offset_y = cam_cfg["resolution"].get("offset_y")
+        bw_limit = cam_cfg.get("bandwidth_limit_mbs", 160)
+        cam_left = XimeaCamera(left_idx, width, height, exposure, gain, offset_x, offset_y, bw_limit)
+        cam_right = XimeaCamera(right_idx, width, height, exposure, gain, offset_x, offset_y, bw_limit)
 
     elif cam_type == "mindvision":
         logger.info("Initializing MindVision cameras (indices %d, %d).", left_idx, right_idx)
@@ -314,6 +317,13 @@ def main() -> None:
             det_y = (height * 2 - 90) if is_hsv_calibrate else (height - 90)
 
             fps_actual = 1.0 / max(time.perf_counter() - t_loop_start, 1e-9)
+            if not hasattr(main, 'loop_cnt'):
+                main.loop_cnt = 0
+                main.t_fps_start = time.perf_counter()
+            main.loop_cnt += 1
+            if main.loop_cnt % 30 == 0:
+                avg_fps = main.loop_cnt / (time.perf_counter() - main.t_fps_start)
+                logger.info("Average FPS (last 30 frames): %.1f", avg_fps)
             _draw_hud(
                 display_frame, fps_actual, tracking_success,
                 x_3d, y_3d, z_3d,

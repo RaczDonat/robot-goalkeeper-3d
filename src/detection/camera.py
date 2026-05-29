@@ -9,6 +9,7 @@ and MockCamera for simulation/testing.
 import time
 import math
 import logging
+import threading
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
@@ -54,6 +55,14 @@ class CameraInterface(ABC):
     def set_gain(self, gain: float) -> None:
         """Dynamically set the analog gain in dB."""
 
+    @abstractmethod
+    def get_temperature(self) -> float:
+        """Return the hardware temperature in Celsius. Returns 0.0 if unsupported."""
+
+    @abstractmethod
+    def set_roi(self, width: int, height: int, offset_x: int, offset_y: int) -> bool:
+        """Dynamically set the hardware Region of Interest (ROI)."""
+
 
 # ---------------------------------------------------------------------------
 # XIMEA industrial camera
@@ -85,15 +94,31 @@ class XimeaCamera(CameraInterface):
         height: int = 720,
         exposure_time_us: int = 800,
         gain: float = 0.0,
+        offset_x: Optional[int] = None,
+        offset_y: Optional[int] = None,
+        bandwidth_limit_mbs: int = 160,
     ) -> None:
         self.camera_index = camera_index
         self.width = width
         self.height = height
         self.exposure_time_us = exposure_time_us
         self.gain = gain
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        self.bandwidth_limit_mbs = bandwidth_limit_mbs
         self._cam = None          # ximea.xiapi.Camera instance
         self._img = None          # ximea.xiapi.Image instance (reused every frame)
         self._last_timestamp: float = 0.0
+        self._running: bool = False
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._frame_ready_event = threading.Event()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._ret: bool = False
+        self._pending_exposure: Optional[int] = None
+        self._pending_gain: Optional[float] = None
+        self._last_temperature: float = 0.0
+        self._temp_counter: int = 0
 
     # ------------------------------------------------------------------
     # CameraInterface implementation
@@ -110,11 +135,38 @@ class XimeaCamera(CameraInterface):
             self._configure_roi()
             self._configure_exposure()
 
+            # ── Limit per-camera bandwidth to leave headroom for the second camera
+            # and for USB control commands (set_exposure, set_gain, etc.).
+            # With two cameras each limited to 160 MB/s the total is 320 MB/s which
+            # is safely below the ~400 MB/s USB3 bus capacity.  Without this limit
+            # each camera grabs the full measured bandwidth (≈317 MB/s) causing
+            # bus saturation that makes get_image() time out unpredictably.
+            _bw_limit_mbs = self.bandwidth_limit_mbs
+            try:
+                self._cam.set_limit_bandwidth(_bw_limit_mbs)
+                logger.info("XimeaCamera[%d] bandwidth limited to %d MB/s",
+                            self.camera_index, _bw_limit_mbs)
+            except Exception:
+                try:
+                    self._cam.set_param("limit_bandwidth", float(_bw_limit_mbs))
+                    logger.info("XimeaCamera[%d] bandwidth limited via set_param to %d MB/s",
+                                self.camera_index, _bw_limit_mbs)
+                except Exception as bw_exc:
+                    logger.warning("XimeaCamera[%d] could not set bandwidth limit: %s",
+                                   self.camera_index, bw_exc)
+
             self._cam.start_acquisition()
             self._img = xiapi.Image()
 
+            self._running = True
+            self._latest_frame = None
+            self._ret = False
+            self._frame_ready_event.clear()
+            self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self._thread.start()
+
             logger.info(
-                "XimeaCamera[%d] opened – %dx%d, exp=%d µs, gain=%.1f dB",
+                "XimeaCamera[%d] opened (async thread started) – %dx%d, exp=%d µs, gain=%.1f dB",
                 self.camera_index, self.width, self.height,
                 self.exposure_time_us, self.gain,
             )
@@ -124,30 +176,116 @@ class XimeaCamera(CameraInterface):
             logger.error("XimeaCamera[%d] failed to open: %s", self.camera_index, exc)
             return False
 
+    def _capture_loop(self) -> None:
+        _consecutive_timeouts = 0
+        _MAX_TIMEOUTS_BEFORE_RECOVERY = 5  # restart acquisition after N consecutive timeouts
+
+        while self._running:
+            try:
+                if self._cam is None or self._img is None:
+                    time.sleep(0.005)
+                    continue
+
+                if self._pending_exposure is not None:
+                    try:
+                        self._cam.set_exposure(self._pending_exposure)
+                    except Exception as exc:
+                        logger.warning("XimeaCamera[%d] background set_exposure error: %s",
+                                       self.camera_index, exc)
+                    self._pending_exposure = None
+
+                if self._pending_gain is not None:
+                    try:
+                        self._cam.set_gain(self._pending_gain)
+                    except Exception as exc:
+                        logger.warning("XimeaCamera[%d] background set_gain error: %s",
+                                       self.camera_index, exc)
+                    self._pending_gain = None
+
+                # timeout=200 ms: allows the loop to check _running frequently
+                # and exit within ~200 ms when stop is requested.
+                self._cam.get_image(self._img, timeout=200)
+                self._last_timestamp = time.time()
+
+                # Successful frame – reset the consecutive-timeout counter
+                _consecutive_timeouts = 0
+
+                rgb = self._img.get_image_data_numpy()
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+                # Software resize only if sensor ROI could not be set exactly
+                if bgr.shape[1] != self.width or bgr.shape[0] != self.height:
+                    bgr = cv2.resize(bgr, (self.width, self.height))
+
+                with self._lock:
+                    self._latest_frame = bgr
+                    self._ret = True
+                self._frame_ready_event.set()
+
+            except Exception as exc:
+                err_str = str(exc)
+                is_timeout = ("10" in err_str) or ("Timeout" in err_str) or ("timeout" in err_str)
+
+                if is_timeout:
+                    _consecutive_timeouts += 1
+                    logger.debug("XimeaCamera[%d] get_image timeout #%d",
+                                 self.camera_index, _consecutive_timeouts)
+
+                    if _consecutive_timeouts >= _MAX_TIMEOUTS_BEFORE_RECOVERY:
+                        # Camera stopped sending frames – try to restart acquisition
+                        logger.warning(
+                            "XimeaCamera[%d] %d consecutive timeouts – restarting acquisition…",
+                            self.camera_index, _consecutive_timeouts,
+                        )
+                        try:
+                            self._cam.stop_acquisition()
+                        except Exception:
+                            pass
+                        time.sleep(0.05)
+                        try:
+                            self._cam.start_acquisition()
+                            _consecutive_timeouts = 0
+                            logger.info("XimeaCamera[%d] acquisition restarted successfully.",
+                                        self.camera_index)
+                        except Exception as restart_exc:
+                            logger.error("XimeaCamera[%d] restart failed: %s",
+                                         self.camera_index, restart_exc)
+                            break  # Unrecoverable; exit thread
+                else:
+                    logger.error("XimeaCamera[%d] capture thread error: %s",
+                                 self.camera_index, exc)
+                    time.sleep(0.01)
+
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Acquire one frame and return it as a BGR numpy array."""
-        if self._cam is None or self._img is None:
+        """Acquire one frame and return it as a BGR numpy array.
+
+        Returns a .copy() of the internal frame buffer so the caller is free
+        to modify it (e.g. draw_overlay) without data races against the capture
+        thread that may simultaneously write a new frame into _latest_frame.
+        """
+        if not self._running:
             return False, None
 
-        try:
-            self._cam.get_image(self._img)
-            self._last_timestamp = time.time()
+        # Wait for a new frame from background thread with 100 ms timeout
+        is_new = self._frame_ready_event.wait(timeout=0.1)
+        if is_new:
+            self._frame_ready_event.clear()
 
-            rgb = self._img.get_image_data_numpy()
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        with self._lock:
+            frame = self._latest_frame
+            ret = self._ret
 
-            # Software resize only if sensor ROI could not be set exactly
-            if bgr.shape[1] != self.width or bgr.shape[0] != self.height:
-                bgr = cv2.resize(bgr, (self.width, self.height))
-
-            return True, bgr
-
-        except Exception as exc:
-            logger.error("XimeaCamera[%d] frame read error: %s", self.camera_index, exc)
+        if frame is None:
             return False, None
+        return ret, frame.copy()
 
     def close(self) -> None:
         """Stop acquisition and release the device handle."""
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
         if self._cam is None:
             return
         try:
@@ -163,21 +301,67 @@ class XimeaCamera(CameraInterface):
     def get_timestamp(self) -> float:
         return self._last_timestamp
 
+    def _stop_thread_only(self) -> None:
+        """
+        Stop the background capture thread without touching acquisition.
+        Used for coordinated multi-camera ROI changes: stop all threads first,
+        then reconfigure all cameras, then restart all threads.
+        This prevents USB bus contention between cameras during ROI changes.
+        """
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)  # 200 ms acqtimeout + processing margin
+            self._thread = None
+
+    def _start_thread_only(self) -> None:
+        """Restart the background capture thread after a coordinated stop."""
+        self._running = True
+        self._latest_frame = None
+        self._ret = False
+        self._frame_ready_event.clear()
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
     def set_exposure(self, us: int) -> None:
         self.exposure_time_us = us
-        if self._cam is not None:
-            try:
-                self._cam.set_exposure(us)
-            except Exception as exc:
-                logger.warning("XimeaCamera[%d] set_exposure error: %s", self.camera_index, exc)
+        self._pending_exposure = us
 
     def set_gain(self, gain: float) -> None:
         self.gain = gain
-        if self._cam is not None:
+        self._pending_gain = gain
+
+    def get_temperature(self) -> float:
+        return self._last_temperature
+
+    def set_roi(self, width: int, height: int, offset_x: int, offset_y: int) -> bool:
+        """
+        Change the hardware ROI safely by stopping the capture thread first.
+        For multi-camera coordinated changes use _stop_thread_only / _start_thread_only
+        so both camera threads are stopped before either acquisition is modified.
+        """
+        if self._cam is None:
+            return False
+        self._stop_thread_only()
+        ok = False
+        try:
             try:
-                self._cam.set_gain(gain)
-            except Exception as exc:
-                logger.warning("XimeaCamera[%d] set_gain error: %s", self.camera_index, exc)
+                self._cam.stop_acquisition()
+            except Exception:
+                pass
+            self.width   = width
+            self.height  = height
+            self.offset_x = offset_x
+            self.offset_y = offset_y
+            self._configure_roi()
+            self._cam.start_acquisition()
+            logger.info("XimeaCamera[%d] ROI set: %dx%d @ (%d,%d)",
+                        self.camera_index, width, height, offset_x, offset_y)
+            ok = True
+        except Exception as exc:
+            logger.error("XimeaCamera[%d] set_roi error: %s", self.camera_index, exc)
+        finally:
+            self._start_thread_only()
+        return ok
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -192,9 +376,14 @@ class XimeaCamera(CameraInterface):
             sensor_w: int = self._cam.get_width_maximum()
             sensor_h: int = self._cam.get_height_maximum()
 
-            # Center the ROI and round down to hardware alignment boundary
-            offset_x = ((sensor_w - self.width) // 2 // _ROI_ALIGN_X) * _ROI_ALIGN_X
-            offset_y = ((sensor_h - self.height) // 2 // _ROI_ALIGN_Y) * _ROI_ALIGN_Y
+            if self.offset_x is not None and self.offset_y is not None:
+                offset_x = (self.offset_x // _ROI_ALIGN_X) * _ROI_ALIGN_X
+                offset_y = (self.offset_y // _ROI_ALIGN_Y) * _ROI_ALIGN_Y
+            else:
+                # Center the ROI and round down to hardware alignment boundary
+                offset_x = ((sensor_w - self.width) // 2 // _ROI_ALIGN_X) * _ROI_ALIGN_X
+                offset_y = ((sensor_h - self.height) // 2 // _ROI_ALIGN_Y) * _ROI_ALIGN_Y
+
             self._cam.set_offsetX(offset_x)
             self._cam.set_offsetY(offset_y)
 
@@ -341,6 +530,16 @@ class MindVisionCamera(CameraInterface):
             except Exception as exc:
                 logger.warning("MindVisionCamera[%d] set_gain error: %s", self.camera_index, exc)
 
+    def get_temperature(self) -> float:
+        return 42.0
+
+    def set_roi(self, width: int, height: int, offset_x: int, offset_y: int) -> bool:
+        self.width = width
+        self.height = height
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        return True
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -385,6 +584,9 @@ class MockCamera(CameraInterface):
         self._cap: Optional[cv2.VideoCapture] = None
         self._frame_count: int = 0
         self._last_timestamp: float = 0.0
+        
+        self.offset_x = 0
+        self.offset_y = 0
 
         # Stereo projection parameters (must match StereoTriangulator config)
         self._baseline_mm: float = 300.0
@@ -429,20 +631,43 @@ class MockCamera(CameraInterface):
     def set_gain(self, gain: float) -> None:
         pass  # Mock camera has no real gain
 
+    def get_temperature(self) -> float:
+        # Simulate a normal operating temperature for testing
+        return 38.5 + (time.time() % 10) / 5.0
+
+    def set_roi(self, width: int, height: int, offset_x: int, offset_y: int) -> bool:
+        self.width = width
+        self.height = height
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        return True
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     def _read_video_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
-        if self._cap is None:
-            return False, None
-        ret, frame = self._cap.read()
-        if not ret:  # Loop back to the start for continuous testing
-            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if self._cap is not None:
             ret, frame = self._cap.read()
-        if ret and frame is not None:
-            frame = cv2.resize(frame, (self.width, self.height))
-        return ret, frame
+            if not ret:
+                # Loop video
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self._cap.read()
+            if ret and frame is not None:
+                # Resize to full sensor resolution first to simulate raw capture
+                full_w = 1280
+                full_h = 720
+                if frame.shape[1] != full_w or frame.shape[0] != full_h:
+                    frame = cv2.resize(frame, (full_w, full_h))
+                # Apply ROI Crop
+                ox, oy = self.offset_x, self.offset_y
+                if ox + self.width <= full_w and oy + self.height <= full_h:
+                    frame = frame[oy:oy+self.height, ox:ox+self.width]
+                else:
+                    frame = cv2.resize(frame, (self.width, self.height))
+                return True, frame
+            return False, None
+        return False, None
 
     def _render_synthetic_frame(self) -> np.ndarray:
         """Render a single synthetic frame with a 3D-projected bouncing ball."""

@@ -9,8 +9,11 @@ import os
 import time
 import csv
 import math
+import queue
 import logging
+import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
@@ -25,7 +28,7 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QSlider, QGroupBox, QFormLayout, QPushButton, QComboBox,
         QPlainTextEdit, QMessageBox, QSizePolicy, QDockWidget, QTabWidget,
-        QLineEdit, QToolBar, QMenu, QFileDialog, QCheckBox
+        QLineEdit, QToolBar, QMenu, QFileDialog, QCheckBox, QSpinBox
     )
     import qdarktheme
     import pyqtgraph as pg
@@ -38,7 +41,7 @@ from pc_tracker import load_config, _build_cameras
 from common.network import UDPSender
 from detection.ball_detector import BallDetector, DetectionResult
 from stereo.triangulation import StereoTriangulator
-from detection.camera import MockCamera
+from detection.camera import MockCamera, XimeaCamera
 
 # ---------------------------------------------------------------------------
 # Qt Log Handler
@@ -92,6 +95,9 @@ class TrackerThread(QThread):
         self.csv_writer = None
         self.rec_start_time = 0.0
         
+        # Pre-create the CLAHE object once to avoid repeated memory allocation
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
         # V4 Commands / State
         self._cmd_exposure = -1
         self._cmd_gain = -1.0
@@ -100,13 +106,14 @@ class TrackerThread(QThread):
         self._cmd_method = None
         self._cmd_reset = False
         self._cmd_network = None
+        self._cmd_roi = None
         self._cmd_toggle_rec = False
         self.playback_delay_ms = 0
         self.use_clahe = False
         self.use_blur = False
         self.show_ai_debug = True
 
-    def run(self):
+        # Initialize hardware and models in the main thread to avoid segfaults
         net_cfg    = self.config["network"]
         cam_cfg    = self.config["camera"]
         stereo_cfg = self.config["stereo"]
@@ -137,84 +144,150 @@ class TrackerThread(QThread):
             roi_cfg=det_cfg.get("roi"),
         )
 
-        triangulator = StereoTriangulator(
+        self.triangulator = StereoTriangulator(
             baseline_mm=stereo_cfg["baseline_mm"],
             focal_length_px=stereo_cfg["focal_length_px"],
             cx=stereo_cfg.get("principal_point_x", cam_cfg["resolution"]["width"] / 2.0),
             cy=stereo_cfg.get("principal_point_y", cam_cfg["resolution"]["height"] / 2.0),
         )
 
-        if not self.cam_left.open() or not self.cam_right.open():
+    def run(self):
+        # Open both cameras in parallel – each open() call blocks for several
+        # seconds while the XIMEA SDK initialises USB and configures the sensor.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_l = ex.submit(self.cam_left.open)
+            fut_r = ex.submit(self.cam_right.open)
+            ok_l = fut_l.result()
+            ok_r = fut_r.result()
+
+        if not ok_l or not ok_r:
             self.connection_error.emit("Failed to open cameras.")
             self.sender.close()
             return
 
+        # ── Async detection state ────────────────────────────────────────────
+        # YOLO runs in a separate worker thread so it never blocks the capture loop.
+        # The display FPS is limited only by camera hardware; detection FPS by GPU speed.
+        self._det_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._det_lock  = threading.Lock()
+        self._det_state: Dict = {
+            "result_l": DetectionResult(), "result_r": DetectionResult(),
+            "tracked": False, "x": 0.0, "y": 0.0, "z": 0.0, "det_fps": 0.0,
+        }
+        _det_worker = threading.Thread(target=self._detection_worker, daemon=True)
+        _det_worker.start()
+
+        temp_l = 0.0
+        temp_r = 0.0
+        frame_idx = 0
+
+        # GUI is rate-limited to 60 FPS max to avoid flooding the Qt signal queue
+        # and to reduce frame-copy memory pressure (each emit copies ~5.5 MB).
+        _GUI_EMIT_INTERVAL = 1.0 / 60.0  # seconds between GUI updates
+        _last_gui_emit = 0.0
+
         while self._running:
             t_start = time.perf_counter()
 
-            # Apply commands
+            # Apply commands (exposure, gain, ROI …)
             self._process_commands()
 
-            # Capture
-            ret_l, frame_l = self.cam_left.read()
-            ret_r, frame_r = self.cam_right.read()
+            # ── Parallel stereo read ──────────────────────────────────────
+            _buf = [None, None, None, None]
+
+            def _read_left():
+                _buf[0], _buf[1] = self.cam_left.read()
+
+            def _read_right():
+                _buf[2], _buf[3] = self.cam_right.read()
+
+            _tl = threading.Thread(target=_read_left,  daemon=True)
+            _tr = threading.Thread(target=_read_right, daemon=True)
+            _tl.start(); _tr.start()
+            _tl.join();  _tr.join()
+
+            ret_l, frame_l, ret_r, frame_r = _buf[0], _buf[1], _buf[2], _buf[3]
+
+            frame_idx += 1
 
             if not ret_l or not ret_r or frame_l is None or frame_r is None:
-                time.sleep(0.01)
+                time.sleep(0.005)
                 continue
-                
-            # V4: Playback Slowdown
+
+            # Playback slowdown
             if self.playback_paths and self.playback_delay_ms > 0:
                 time.sleep(self.playback_delay_ms / 1000.0)
 
             timestamp = self.cam_left.get_timestamp()
-            
-            # V4: Image Filtering
+
+            # Image filtering
             if self.use_clahe or self.use_blur:
                 frame_l = self._apply_filters(frame_l)
                 frame_r = self._apply_filters(frame_r)
 
-            # Detect & Triangulate
-            result_l, result_r = self.detector.detect_stereo(frame_l, frame_r)
-            x_3d = y_3d = z_3d = 0.0
-            tracking_success = False
+            # ── Submit frames to async detection (non-blocking) ────────────
+            # Only copy frames when the queue actually has capacity.
+            # Copying 5.5 MB unconditionally at 100+ FPS (even when the queue
+            # is always full) wastes ~500 MB/s of memory bandwidth, which
+            # competes with USB3 DMA and can cause camera timeouts.
+            if not self._det_queue.full():
+                try:
+                    self._det_queue.put_nowait((frame_l.copy(), frame_r.copy(), timestamp))
+                except queue.Full:
+                    pass
 
-            if result_l.success and result_r.success:
-                tracking_success, x_3d, y_3d, z_3d = triangulator.triangulate(
-                    (result_l.x, result_l.y),
-                    (result_r.x, result_r.y),
-                )
-                if tracking_success:
-                    self._draw_overlay(frame_l, result_l)
-                    self._draw_overlay(frame_r, result_r)
-                    
-            # V4: AI Debug Picture-in-Picture (HSV Mask)
+            # ── Read latest detection result (non-blocking, lock-free copy) ──
+            with self._det_lock:
+                det = dict(self._det_state)
+
+            result_l       = det["result_l"]
+            result_r       = det["result_r"]
+            tracking_success = det["tracked"]
+            x_3d, y_3d, z_3d = det["x"], det["y"], det["z"]
+
+            # Draw overlays based on latest detection
+            if tracking_success:
+                self._draw_overlay(frame_l, result_l)
+                self._draw_overlay(frame_r, result_r)
+
+            # AI Debug PiP
             if self.show_ai_debug:
                 self._apply_ai_debug(frame_l)
                 self._apply_ai_debug(frame_r)
 
-            # Send UDP
-            self.sender.send_target_position(x_3d, y_3d, z_3d, tracking_success, timestamp)
-
-            # Record Data (DVR & CSV)
+            # DVR recording
             if self.is_recording:
                 if self.video_out_l and self.video_out_r:
                     self.video_out_l.write(frame_l)
                     self.video_out_r.write(frame_r)
                 if self.csv_writer:
                     rel_t = time.time() - self.rec_start_time
-                    self.csv_writer.writerow([f"{rel_t:.3f}", 1 if tracking_success else 0, f"{x_3d:.1f}", f"{y_3d:.1f}", f"{z_3d:.1f}"])
+                    self.csv_writer.writerow([
+                        f"{rel_t:.3f}", 1 if tracking_success else 0,
+                        f"{x_3d:.1f}", f"{y_3d:.1f}", f"{z_3d:.1f}",
+                    ])
 
-            # Emit
-            fps = 1.0 / max(time.perf_counter() - t_start, 1e-9)
-            stats = {
-                "fps": fps,
-                "tracked": tracking_success,
-                "x": x_3d, "y": y_3d, "z": z_3d,
-                "res_l": result_l,
-                "res_r": result_r
-            }
-            self.frames_ready.emit(frame_l.copy(), frame_r.copy(), stats)
+            # ── Emit frames to GUI (rate-limited to 60 FPS) ──────────────
+            # The camera can run much faster than a monitor can display.
+            # Emitting every frame at 100+ FPS floods the Qt signal queue and
+            # wastes another ~550 MB/s in copies.  We still measure the true
+            # camera FPS and pass it through stats so the label is accurate.
+            cam_fps = 1.0 / max(time.perf_counter() - t_start, 1e-9)
+            _now = time.perf_counter()
+            if _now - _last_gui_emit >= _GUI_EMIT_INTERVAL:
+                _last_gui_emit = _now
+                stats = {
+                    "fps":     cam_fps,
+                    "det_fps": det["det_fps"],
+                    "tracked": tracking_success,
+                    "x": x_3d, "y": y_3d, "z": z_3d,
+                    "res_l":   result_l,
+                    "res_r":   result_r,
+                    "temp_l":  temp_l,
+                    "temp_r":  temp_r,
+                }
+                # read() already returns a .copy(), so no extra copy needed here
+                self.frames_ready.emit(frame_l, frame_r, stats)
 
         # Cleanup
         self._stop_recording()
@@ -222,26 +295,72 @@ class TrackerThread(QThread):
         self.cam_right.close()
         self.sender.close()
 
+    def _detection_worker(self) -> None:
+        """
+        Async detection worker – runs YOLO + HSV at whatever rate the GPU allows.
+
+        Reads stereo frame pairs from self._det_queue, runs detect_stereo(),
+        triangulates, sends UDP, and stores the result in self._det_state.
+        The capture loop reads self._det_state every iteration so the GUI
+        always shows the most recent detection, even across multiple capture frames.
+        """
+        det_fps_ema = 0.0
+
+        while self._running:
+            try:
+                frame_l, frame_r, timestamp = self._det_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            t0 = time.perf_counter()
+
+            result_l, result_r = self.detector.detect_stereo(frame_l, frame_r)
+            x_3d = y_3d = z_3d = 0.0
+            tracking_success = False
+
+            if result_l.success and result_r.success:
+                tracking_success, x_3d, y_3d, z_3d = self.triangulator.triangulate(
+                    (result_l.x, result_l.y),
+                    (result_r.x, result_r.y),
+                )
+
+            # UDP – send at detection rate for minimal control latency
+            self.sender.send_target_position(x_3d, y_3d, z_3d, tracking_success, timestamp)
+
+            dt = max(time.perf_counter() - t0, 1e-9)
+            det_fps_ema = 0.9 * det_fps_ema + 0.1 * (1.0 / dt)
+
+            with self._det_lock:
+                self._det_state = {
+                    "result_l": result_l,
+                    "result_r": result_r,
+                    "tracked":  tracking_success,
+                    "x": x_3d, "y": y_3d, "z": z_3d,
+                    "det_fps":  det_fps_ema,
+                }
+
     def _apply_filters(self, frame: np.ndarray) -> np.ndarray:
         out = frame
         if self.use_blur:
             out = cv2.GaussianBlur(out, (5, 5), 0)
         if self.use_clahe:
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            # Reuse the pre-created CLAHE object (avoids per-frame memory allocation)
             lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
-            lab[:,:,0] = clahe.apply(lab[:,:,0])
+            lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
             out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
         return out
 
     def _apply_ai_debug(self, frame: np.ndarray):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.detector.lower_hsv, self.detector.upper_hsv)
-        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        
-        # 1/4 size pip
         h, w = frame.shape[:2]
         pip_w, pip_h = w // 4, h // 4
-        pip = cv2.resize(mask_bgr, (pip_w, pip_h))
+        
+        # Downsample the BGR frame first (16x pixel reduction)
+        small_bgr = cv2.resize(frame, (pip_w, pip_h), interpolation=cv2.INTER_NEAREST)
+        
+        # Convert to HSV and mask only the small image
+        hsv = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self.detector.lower_hsv, self.detector.upper_hsv)
+        pip = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         
         # Draw red border around pip
         cv2.rectangle(pip, (0,0), (pip_w-1, pip_h-1), (0,0,255), 2)
@@ -267,6 +386,42 @@ class TrackerThread(QThread):
         if self._cmd_method is not None:
             self.detector.method = self._cmd_method
             self._cmd_method = None
+        if self._cmd_roi is not None:
+            w, h, ox, oy = self._cmd_roi
+            self._cmd_roi = None
+            logging.info("Applying coordinated ROI %dx%d @ (%d,%d) to both cameras…", w, h, ox, oy)
+
+            if isinstance(self.cam_left, XimeaCamera):
+                # ── Phase 1: stop BOTH capture threads before touching any acquisition ──
+                # This prevents USB bus contention between cameras during reconfiguration.
+                self.cam_left._stop_thread_only()
+                self.cam_right._stop_thread_only()
+
+                # ── Phase 2: reconfigure both cameras sequentially (threads are stopped) ──
+                for cam in (self.cam_left, self.cam_right):
+                    try:
+                        cam._cam.stop_acquisition()
+                    except Exception:
+                        pass
+                    try:
+                        cam.width, cam.height = w, h
+                        cam.offset_x, cam.offset_y = ox, oy
+                        cam._configure_roi()
+                        cam._cam.start_acquisition()
+                        logging.info("XimeaCamera[%d] ROI OK: %dx%d @ (%d,%d)",
+                                     cam.camera_index, w, h, ox, oy)
+                    except Exception as exc:
+                        logging.error("XimeaCamera[%d] ROI failed: %s", cam.camera_index, exc)
+
+                # ── Phase 3: restart both capture threads ──────────────────────────
+                self.cam_left._start_thread_only()
+                self.cam_right._start_thread_only()
+            else:
+                self.cam_left.set_roi(w, h, ox, oy)
+                self.cam_right.set_roi(w, h, ox, oy)
+
+            self.triangulator.cx = w / 2.0
+            self.triangulator.cy = h / 2.0
         if self._cmd_reset:
             self.detector._kalman_left.reset()
             self.detector._kalman_right.reset()
@@ -325,6 +480,7 @@ class TrackerThread(QThread):
     def set_method(self, method: str): self._cmd_method = method
     def reset_tracker(self): self._cmd_reset = True
     def set_network(self, ip: str, port: int): self._cmd_network = (ip, port)
+    def set_roi(self, w: int, h: int, ox: int, oy: int): self._cmd_roi = (w, h, ox, oy)
     def toggle_recording(self): self._cmd_toggle_rec = True
 
     def _draw_overlay(self, frame: np.ndarray, result: DetectionResult):
@@ -425,6 +581,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_act)
         
         toolbar = QToolBar("Main Toolbar")
+        toolbar.setObjectName("MainToolbar")
         self.addToolBar(toolbar)
         self.act_record = QAction("🔴 Start DVR Recording", self)
         self.act_record.triggered.connect(self.on_toggle_record)
@@ -452,6 +609,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_3d, "🧊 3D Robot Simulator")
         
         self.dock_settings = QDockWidget("Hardware Settings", self)
+        self.dock_settings.setObjectName("HardwareSettingsDock")
         self.dock_settings.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
         widget_settings = QWidget()
         self._build_dock_settings(widget_settings)
@@ -459,12 +617,14 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.dock_settings)
         
         self.dock_stats = QDockWidget("Tracker Analytics", self)
+        self.dock_stats.setObjectName("TrackerAnalyticsDock")
         widget_stats = QWidget()
         self._build_dock_stats(widget_stats)
         self.dock_stats.setWidget(widget_stats)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock_stats)
         
         self.dock_logs = QDockWidget("System Console", self)
+        self.dock_logs.setObjectName("SystemConsoleDock")
         widget_logs = QWidget()
         self._build_dock_logs(widget_logs)
         self.dock_logs.setWidget(widget_logs)
@@ -597,6 +757,8 @@ class MainWindow(QMainWindow):
         
         self.lbl_vid_l.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.lbl_vid_r.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.lbl_vid_l.setMinimumSize(320, 240)
+        self.lbl_vid_r.setMinimumSize(320, 240)
         
         layout.addWidget(self.lbl_vid_l, 1)
         layout.addWidget(self.lbl_vid_r, 1)
@@ -627,10 +789,26 @@ class MainWindow(QMainWindow):
         self.gl_view.opts['elevation'] = 20
         self.gl_view.opts['azimuth'] = 45
         
-        grid = gl.GLGridItem()
-        grid.setSize(x=5000, y=5000, z=0)
-        grid.setSpacing(x=500, y=500, z=0)
-        self.gl_view.addItem(grid)
+        # 3D Football Field Grass
+        grass = gl.GLBoxItem(size=QVector3D(8000, 10, 8000), color=(0.1, 0.4, 0.1, 1.0))
+        grass.translate(-4000, -200, -2000)
+        self.gl_view.addItem(grass)
+        
+        # White Field Lines
+        line_pts = np.array([
+            # Outer boundary
+            [-3000, -190, 0], [3000, -190, 0],
+            [3000, -190, 0], [3000, -190, 6000],
+            [3000, -190, 6000], [-3000, -190, 6000],
+            [-3000, -190, 6000], [-3000, -190, 0],
+            # Goal area
+            [-1000, -190, self.Z_GOAL], [1000, -190, self.Z_GOAL],
+            [1000, -190, self.Z_GOAL], [1000, -190, self.Z_GOAL + 1500],
+            [1000, -190, self.Z_GOAL + 1500], [-1000, -190, self.Z_GOAL + 1500],
+            [-1000, -190, self.Z_GOAL + 1500], [-1000, -190, self.Z_GOAL],
+        ])
+        field_lines = gl.GLLinePlotItem(pos=line_pts, color=(1, 1, 1, 1), width=3, antialias=True, mode='lines')
+        self.gl_view.addItem(field_lines)
         
         goal_box = gl.GLBoxItem(size=QVector3D(1200, 200, 800), color=(0.2, 0.8, 0.2, 0.3))
         goal_box.translate(-600, -100, self.Z_GOAL)
@@ -648,6 +826,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.gl_view)
 
     def _build_dock_settings(self, parent: QWidget):
+        parent.setFixedWidth(320)
         layout = QVBoxLayout(parent)
         
         # V4: Software Filters & Playback Controls
@@ -701,6 +880,33 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.grp_cam)
         self.grp_boxes.append(self.grp_cam)
         
+        # Hardware ROI
+        self.grp_roi = QGroupBox("Hardware ROI (Crop)")
+        roi_lay = QFormLayout(self.grp_roi)
+        self.sp_roi_w = QSpinBox()
+        self.sp_roi_w.setRange(16, 1936)
+        self.sp_roi_w.setValue(self.config["camera"]["resolution"]["width"])
+        self.sp_roi_h = QSpinBox()
+        self.sp_roi_h.setRange(16, 1216)
+        self.sp_roi_h.setValue(self.config["camera"]["resolution"]["height"])
+        self.sp_roi_ox = QSpinBox()
+        self.sp_roi_ox.setRange(0, 1936)
+        self.sp_roi_ox.setValue(self.config["camera"]["resolution"].get("offset_x", 0))
+        self.sp_roi_oy = QSpinBox()
+        self.sp_roi_oy.setRange(0, 1216)
+        self.sp_roi_oy.setValue(self.config["camera"]["resolution"].get("offset_y", 0))
+        
+        btn_apply_roi = QPushButton("Apply ROI")
+        btn_apply_roi.clicked.connect(self._on_apply_roi)
+        
+        roi_lay.addRow("Width:", self.sp_roi_w)
+        roi_lay.addRow("Height:", self.sp_roi_h)
+        roi_lay.addRow("Offset X:", self.sp_roi_ox)
+        roi_lay.addRow("Offset Y:", self.sp_roi_oy)
+        roi_lay.addRow("", btn_apply_roi)
+        layout.addWidget(self.grp_roi)
+        self.grp_boxes.append(self.grp_roi)
+        
         self.grp_hsv = QGroupBox("HSV Fallback")
         hsv_lay = QFormLayout(self.grp_hsv)
         bounds = self.config["detection"].get("hsv_bounds", {})
@@ -737,6 +943,7 @@ class MainWindow(QMainWindow):
         layout.addStretch()
 
     def _build_dock_stats(self, parent: QWidget):
+        parent.setFixedWidth(280)
         layout = QVBoxLayout(parent)
         
         self.grp_algo = QGroupBox("Algorithm Control")
@@ -759,18 +966,29 @@ class MainWindow(QMainWindow):
         stat_lay = QFormLayout(self.grp_stats)
         
         self.lbl_fps = QLabel("0.0")
+        self.lbl_det_fps = QLabel("0.0")
         self.lbl_status = QLabel("N/A")
         self.lbl_3d = QLabel("[0.0, 0.0, 0.0]")
         self.lbl_angle = QLabel("0.0°")
         self.lbl_conf_l = QLabel("--")
         self.lbl_conf_r = QLabel("--")
-        
+
+        self.lbl_fps.setMinimumWidth(150)
+        self.lbl_det_fps.setMinimumWidth(150)
+        self.lbl_status.setMinimumWidth(150)
+        self.lbl_3d.setMinimumWidth(150)
+        self.lbl_angle.setMinimumWidth(150)
+        self.lbl_conf_l.setMinimumWidth(150)
+        self.lbl_conf_r.setMinimumWidth(150)
+
         self.lbl_fps.setStyleSheet("color: #00FF00; font-weight: bold; font-size: 16px;")
+        self.lbl_det_fps.setStyleSheet("color: #FFD740; font-weight: bold; font-size: 14px;")
         self.lbl_status.setStyleSheet("font-weight: bold; font-size: 14px;")
         self.lbl_3d.setStyleSheet("color: #00E676; font-family: monospace; font-size: 14px;")
         self.lbl_angle.setStyleSheet("color: #FF1744; font-weight: bold; font-size: 16px;")
-        
-        stat_lay.addRow("System FPS:", self.lbl_fps)
+
+        stat_lay.addRow("Camera FPS:", self.lbl_fps)
+        stat_lay.addRow("Detection FPS:", self.lbl_det_fps)
         stat_lay.addRow("Tracking State:", self.lbl_status)
         stat_lay.addRow("Target (mm):", self.lbl_3d)
         stat_lay.addRow("Req. Tilt Angle:", self.lbl_angle)
@@ -783,8 +1001,18 @@ class MainWindow(QMainWindow):
         hw_lay = QFormLayout(self.grp_hw)
         self.lbl_cpu = QLabel("0 %")
         self.lbl_ram = QLabel("0 %")
+        self.lbl_temp_l = QLabel("N/A")
+        self.lbl_temp_r = QLabel("N/A")
+        
+        self.lbl_cpu.setMinimumWidth(150)
+        self.lbl_ram.setMinimumWidth(150)
+        self.lbl_temp_l.setMinimumWidth(150)
+        self.lbl_temp_r.setMinimumWidth(150)
+        
         hw_lay.addRow("CPU Usage:", self.lbl_cpu)
         hw_lay.addRow("RAM Usage:", self.lbl_ram)
+        hw_lay.addRow("Cam L Temp:", self.lbl_temp_l)
+        hw_lay.addRow("Cam R Temp:", self.lbl_temp_r)
         layout.addWidget(self.grp_hw)
         self.grp_boxes.append(self.grp_hw)
         
@@ -822,6 +1050,14 @@ class MainWindow(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "Invalid Port", "Port must be a number.")
 
+    def _on_apply_roi(self):
+        w = self.sp_roi_w.value()
+        h = self.sp_roi_h.value()
+        ox = self.sp_roi_ox.value()
+        oy = self.sp_roi_oy.value()
+        self.tracker_thread.set_roi(w, h, ox, oy)
+        self.statusBar().showMessage(f"Hardware ROI set to {w}x{h} @ ({ox}, {oy})", 3000)
+
     def on_save_config(self):
         try:
             import yaml
@@ -855,11 +1091,23 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(np.ndarray, np.ndarray, dict)
     def on_frames_ready(self, frame_l, frame_r, stats):
-        if self.tabs.currentIndex() == 0:
-            self.lbl_vid_l.setPixmap(self._cv_to_pixmap(frame_l, self.lbl_vid_l.size()))
-            self.lbl_vid_r.setPixmap(self._cv_to_pixmap(frame_r, self.lbl_vid_r.size()))
-        
-        self.lbl_fps.setText(f"{stats['fps']:.1f}")
+        try:
+            if self.tabs.currentIndex() == 0:
+                # Use a unified target size based on the minimum label dimensions to prevent left-right divider jumping
+                target_w = min(self.lbl_vid_l.width(), self.lbl_vid_r.width())
+                target_h = min(self.lbl_vid_l.height(), self.lbl_vid_r.height())
+                from PyQt6.QtCore import QSize
+                unified_size = QSize(target_w, target_h)
+
+                if frame_l is not None and frame_l.size > 0:
+                    self.lbl_vid_l.setPixmap(self._cv_to_pixmap(frame_l, unified_size))
+                if frame_r is not None and frame_r.size > 0:
+                    self.lbl_vid_r.setPixmap(self._cv_to_pixmap(frame_r, unified_size))
+            
+            self.lbl_fps.setText(f"{stats['fps']:.1f}")
+            self.lbl_det_fps.setText(f"{stats.get('det_fps', 0.0):.1f}")
+        except Exception as e:
+            logging.error(f"GUI Error in on_frames_ready: {e}")
         current_time = time.time() - self.t_start
         self.data_t.append(current_time)
         
@@ -926,6 +1174,22 @@ class MainWindow(QMainWindow):
         self.lbl_conf_l.setText(fmt_conf(stats['res_l']))
         self.lbl_conf_r.setText(fmt_conf(stats['res_r']))
         
+        t_l = stats.get('temp_l', 0.0)
+        t_r = stats.get('temp_r', 0.0)
+        self.lbl_temp_l.setText(f"{t_l:.1f} °C")
+        self.lbl_temp_r.setText(f"{t_r:.1f} °C")
+        
+        if t_l > 60.0 or t_r > 60.0:
+            warn_style = "color: #FFFFFF; background-color: #FF0000; font-weight: bold; padding: 2px;"
+            self.lbl_temp_l.setStyleSheet(warn_style if t_l > 60.0 else "")
+            self.lbl_temp_r.setStyleSheet(warn_style if t_r > 60.0 else "")
+            if not hasattr(self, 'overheat_warned'):
+                self.overheat_warned = True
+                QMessageBox.critical(self, "OVERHEAT WARNING", "A kamerák hőmérséklete átlépte a kritikus 60 °C-ot!\nAzonnal állítsd le a rendszert és húzd ki az USB-t!")
+        else:
+            self.lbl_temp_l.setStyleSheet("")
+            self.lbl_temp_r.setStyleSheet("")
+        
         if self.tabs.currentIndex() == 1:
             self.curve_x.setData(list(self.data_t), list(self.data_x))
             self.curve_y.setData(list(self.data_t), list(self.data_y))
@@ -938,11 +1202,21 @@ class MainWindow(QMainWindow):
 
     def _cv_to_pixmap(self, cv_img: np.ndarray, size) -> QPixmap:
         h, w, ch = cv_img.shape
+        # Round the target dimensions to the nearest multiple of 32 to prevent minor layout jitters
+        target_w = (size.width() // 32) * 32
+        target_h = (size.height() // 32) * 32
+        if target_w > 0 and target_h > 0:
+            scale = min(target_w / w, target_h / h)
+            if scale < 1.0:
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                cv_img = cv2.resize(cv_img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                h, w = new_h, new_w
+                
         bytes_per_line = ch * w
         rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        pm = QPixmap.fromImage(qimg)
-        return pm.scaled(size.width(), size.height(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        return QPixmap.fromImage(qimg)
 
     def closeEvent(self, event):
         if hasattr(self, 'tracker_thread') and self.tracker_thread.isRunning():
@@ -953,7 +1227,7 @@ def main():
     app = QApplication(sys.argv)
     config = load_config("config/system_config.yaml")
     window = MainWindow(config)
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
